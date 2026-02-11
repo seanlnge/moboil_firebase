@@ -1,13 +1,15 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Allow authenticated users to create bookings
     match /bookings/{bookingId} {
-      // Allow create if the user is signed in
+      // Allow authenticated users to create bookings only
       allow create: if request.auth != null;
       
-      // Allow read/update/delete only if the user owns the booking
-      allow read, update, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      // Disallow all reads from the client — use Cloud Functions instead
+      allow read: if false;
+      
+      // Disallow update/delete from the client
+      allow update, delete: if false;
     }
   }
 }

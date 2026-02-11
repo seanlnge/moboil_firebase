@@ -1,4 +1,5 @@
 import { onDocumentCreated, FirestoreEvent } from "firebase-functions/v2/firestore";
+import { onCall, HttpsError } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
 import * as admin from "firebase-admin";
 import sgMail from "@sendgrid/mail";
@@ -22,12 +23,133 @@ interface BookingData {
   carYear?: string;
   carMake?: string;
   carModel?: string;
+  status?: string;
   emailStatus?: {
     customer?: string;
     admin?: string;
   };
   [key: string]: any;
 }
+
+// Available time slots as { hour, minute } pairs
+const TIME_SLOTS = [
+  { hour: 9, minute: 30 },   // 9:30 AM
+  { hour: 11, minute: 0 },   // 11:00 AM
+  { hour: 13, minute: 0 },   // 1:00 PM
+  { hour: 14, minute: 30 },  // 2:30 PM
+  { hour: 16, minute: 0 },   // 4:00 PM
+  { hour: 17, minute: 30 },  // 5:30 PM
+];
+
+/**
+ * Returns the UTC offset in hours for America/New_York at a given date.
+ * Accounts for EST (-5) vs EDT (-4) automatically.
+ */
+function getEasternOffsetHours(date: Date): number {
+  // Build a formatter that tells us the UTC offset for Eastern time
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    timeZoneName: "shortOffset",
+  }).formatToParts(date);
+
+  const tzPart = parts.find((p) => p.type === "timeZoneName");
+  // tzPart.value will be something like "GMT-5" or "GMT-4"
+  if (tzPart) {
+    const match = tzPart.value.match(/GMT([+-]\d+)/);
+    if (match) return parseInt(match[1], 10);
+  }
+  return -5; // Fallback to EST
+}
+
+/**
+ * Callable function that returns available booking slots.
+ * Generates all Mon-Sat slots for the next 3 weeks (after Feb 20, 2026),
+ * then removes any slots already taken by existing bookings.
+ * All times are generated in America/New_York timezone.
+ */
+export const getAvailableSlots = onCall(
+  { region: "us-east1" },
+  async () => {
+    const now = Date.now();
+
+    // Build a helper that creates a UTC timestamp for a given
+    // Eastern-time calendar date + time-of-day.
+    function toEasternTimestamp(year: number, month: number, day: number, hour: number, minute: number): number {
+      // Create a date in UTC that *looks like* the Eastern date
+      const utc = Date.UTC(year, month, day, hour, minute, 0, 0);
+      // Determine the Eastern offset for that moment
+      const offset = getEasternOffsetHours(new Date(utc));
+      // Shift by the offset so the resulting UTC instant corresponds
+      // to the desired Eastern wall-clock time
+      return utc - offset * 60 * 60 * 1000;
+    }
+
+    // Determine start date in Eastern time
+    const nowEastern = new Date(
+      new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
+    );
+    const launchDate = new Date(2026, 1, 21); // Feb 21, 2026
+    const startDate = nowEastern > launchDate ? new Date(nowEastern) : new Date(launchDate);
+
+    if (nowEastern > launchDate) {
+      startDate.setDate(startDate.getDate() + 1);
+    }
+    startDate.setHours(0, 0, 0, 0);
+
+    // Generate all possible slots for the next 21 days (Mon-Sat)
+    const allSlots: number[] = [];
+    const current = new Date(startDate);
+
+    for (let i = 0; i < 21; i++) {
+      const dayOfWeek = current.getDay();
+      // Skip Sundays (0)
+      if (dayOfWeek !== 0) {
+        const y = current.getFullYear();
+        const m = current.getMonth();
+        const d = current.getDate();
+
+        for (const slot of TIME_SLOTS) {
+          const ts = toEasternTimestamp(y, m, d, slot.hour, slot.minute);
+          // Only include future slots
+          if (ts > now) {
+            allSlots.push(ts);
+          }
+        }
+      }
+      current.setDate(current.getDate() + 1);
+    }
+
+    // Get the range boundaries for querying
+    const minTime = allSlots.length > 0 ? allSlots[0] : 0;
+    const maxTime = allSlots.length > 0 ? allSlots[allSlots.length - 1] : 0;
+
+    if (allSlots.length === 0) {
+      return { slots: [] };
+    }
+
+    // Query existing bookings that fall within our slot range
+    const bookingsSnap = await admin
+      .firestore()
+      .collection("bookings")
+      .where("dateTime", ">=", minTime)
+      .where("dateTime", "<=", maxTime)
+      .where("status", "in", ["pending", "confirmed"])
+      .get();
+
+    const takenTimes = new Set<number>();
+    bookingsSnap.forEach((doc) => {
+      const data = doc.data() as BookingData;
+      if (data.dateTime) {
+        takenTimes.add(data.dateTime);
+      }
+    });
+
+    // Filter out taken slots
+    const availableSlots = allSlots.filter((ts) => !takenTimes.has(ts));
+
+    return { slots: availableSlots };
+  }
+);
 
 export const onBookingCreated = onDocumentCreated(
   {
@@ -171,11 +293,10 @@ export const onBookingCreated = onDocumentCreated(
       service: booking.service || "Oil Change",
       bookingDate,
       bookingTime,
-      bookingId,
 
       // buttons
       manageUrl: booking.manageUrl || "", // optional
-      cancelUrl: booking.cancelUrl || "", // required in your template
+      cancelUrl: `https://moboil.org/booking?cancel=${bookingId}`,
 
       // car
       carSummary,
@@ -264,5 +385,56 @@ export const onBookingCreated = onDocumentCreated(
       );
       throw err; // let Firebase retry
     }
+  }
+);
+
+interface CancelBookingRequest {
+  bookingId: string;
+}
+
+/**
+ * Callable function to cancel a booking.
+ * Verifies the caller owns the booking, then sets status to "cancelled".
+ */
+export const cancelBooking = onCall(
+  { region: "us-east1" },
+  async (request) => {
+    // Require authentication
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be signed in to cancel a booking.");
+    }
+
+    const { bookingId } = request.data as CancelBookingRequest;
+
+    if (!bookingId || typeof bookingId !== "string") {
+      throw new HttpsError("invalid-argument", "A valid bookingId is required.");
+    }
+
+    const bookingRef = admin.firestore().collection("bookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+
+    if (!bookingSnap.exists) {
+      throw new HttpsError("not-found", "Booking not found.");
+    }
+
+    const bookingData = bookingSnap.data() as BookingData;
+
+    // Verify ownership
+    if (bookingData.userId !== request.auth.uid) {
+      throw new HttpsError("permission-denied", "You can only cancel your own bookings.");
+    }
+
+    // Check if already cancelled
+    if (bookingData.status === "cancelled") {
+      return { success: true, message: "Booking was already cancelled." };
+    }
+
+    // Set status to cancelled
+    await bookingRef.update({
+      status: "cancelled",
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { success: true, message: "Booking cancelled successfully." };
   }
 );
