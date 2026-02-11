@@ -214,8 +214,6 @@ export const onBookingCreated = onDocumentCreated(
     const adminEmail = ADMIN_EMAIL.value();
 
     // --- 4) Build template data (matches your HTML handlebars vars) ---
-    const year = new Date().getFullYear();
-
     // Decipher date and time from dateTime timestamp
     let bookingDate = "";
     let bookingTime = "";
@@ -288,7 +286,7 @@ export const onBookingCreated = onDocumentCreated(
 
     const dynamicTemplateData = {
       brandName: booking.brandName || "Moboil",
-      year,
+      year: booking.dateTime ? new Date(booking.dateTime).getFullYear() : new Date().getFullYear(),
       name: customerName,
       service: booking.service || "Oil Change",
       bookingDate,
@@ -394,10 +392,11 @@ interface CancelBookingRequest {
 
 /**
  * Callable function to cancel a booking.
- * Verifies the caller owns the booking, then sets status to "cancelled".
+ * Verifies the caller owns the booking, sets status to "cancelled",
+ * and sends a cancellation confirmation email.
  */
 export const cancelBooking = onCall(
-  { region: "us-east1" },
+  { region: "us-east1", secrets: [SENDGRID_API_KEY, SENDGRID_FROM, ADMIN_EMAIL] },
   async (request) => {
     // Require authentication
     if (!request.auth) {
@@ -434,6 +433,86 @@ export const cancelBooking = onCall(
       status: "cancelled",
       cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // Send cancellation confirmation email
+    const customerEmail = bookingData.email || bookingData.userEmail;
+    if (customerEmail) {
+      try {
+        sgMail.setApiKey(SENDGRID_API_KEY.value());
+        const from = SENDGRID_FROM.value();
+
+        // Build name
+        const customerName = bookingData.firstName && bookingData.lastName
+          ? `${bookingData.firstName} ${bookingData.lastName}`
+          : bookingData.firstName || "there";
+
+        // Build date/time strings from dateTime
+        let bookingDate = "";
+        let bookingTime = "";
+        if (bookingData.dateTime) {
+          const dateObj = new Date(bookingData.dateTime);
+          bookingDate = dateObj.toLocaleDateString("en-US", {
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+            timeZone: "America/New_York",
+          });
+          bookingTime = dateObj.toLocaleTimeString("en-US", {
+            hour: "numeric",
+            minute: "2-digit",
+            timeZone: "America/New_York",
+          });
+        }
+
+        // Build car summary
+        const carYear = bookingData.carYear ?? "";
+        const carMake = bookingData.carMake ?? "";
+        const carModel = bookingData.carModel ?? "";
+        const carSummary = [carYear, carMake, carModel].filter(Boolean).join(" ").trim();
+
+        // Send cancellation email to customer
+        await sgMail.send({
+          to: customerEmail,
+          from,
+          templateId: "d-9bfc0a81cb424c6eb91628e9500040e2", // TODO: replace with actual SendGrid template ID
+          dynamicTemplateData: {
+            brandName: "Moboil",
+            year: bookingData.dateTime ? new Date(bookingData.dateTime).getFullYear() : new Date().getFullYear(),
+            name: customerName,
+            bookingDate,
+            bookingTime,
+            carSummary,
+            carYear,
+            carMake,
+            carModel,
+            service: bookingData.service || "Oil Change",
+            rebookUrl: "https://moboil.org/booking",
+          },
+        });
+
+        // Send cancellation notification to admin
+        const adminEmailAddr = ADMIN_EMAIL.value();
+        const address = bookingData.address || "";
+        await sgMail.send({
+          to: adminEmailAddr,
+          from,
+          subject: "Booking cancelled",
+          text:
+            `Booking cancelled\n\n` +
+            `Name: ${customerName}\n` +
+            `Email: ${customerEmail}\n` +
+            `Phone: ${bookingData.phone || "N/A"}\n` +
+            `When: ${bookingDate} ${bookingTime}\n` +
+            `Service: ${bookingData.service || "Oil Change"}\n` +
+            `Car: ${carSummary}\n` +
+            `Address: ${address}\n` +
+            `Booking ID: ${bookingId}\n`,
+        });
+      } catch (emailErr) {
+        // Log but don't fail the cancellation itself
+        console.error("Failed to send cancellation email:", emailErr);
+      }
+    }
 
     return { success: true, message: "Booking cancelled successfully." };
   }
