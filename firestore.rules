@@ -1,0 +1,13 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow authenticated users to create bookings
+    match /bookings/{bookingId} {
+      // Allow create if the user is signed in
+      allow create: if request.auth != null;
+      
+      // Allow read/update/delete only if the user owns the booking
+      allow read, update, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+  }
+}
