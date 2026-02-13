@@ -111,6 +111,7 @@ export const getAvailableSlots = onCall(
         const d = current.getDate();
 
         for (const slot of TIME_SLOTS) {
+          if((dayOfWeek === 1 || dayOfWeek === 2) && slot.hour >= 16) continue; // Skip Mondays and Tuesdays 4pm or later
           const ts = toEasternTimestamp(y, m, d, slot.hour, slot.minute);
           // Only include future slots
           if (ts > now) {
