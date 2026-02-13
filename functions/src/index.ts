@@ -1,5 +1,7 @@
 import { onDocumentCreated, FirestoreEvent } from "firebase-functions/v2/firestore";
-import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { onCall, onRequest, HttpsError } from "firebase-functions/v2/https";
+import Busboy from "busboy";
+import { simpleParser } from "mailparser";
 import { defineSecret } from "firebase-functions/params";
 import * as admin from "firebase-admin";
 import sgMail from "@sendgrid/mail";
@@ -515,5 +517,106 @@ export const cancelBooking = onCall(
     }
 
     return { success: true, message: "Booking cancelled successfully." };
+  }
+);
+
+/**
+ * HTTP POST endpoint for SendGrid Inbound Parse.
+ * Receives the raw full-MIME message via multipart/form-data,
+ * extracts sender, subject, and body, then relays the message
+ * to the admin email.
+ */
+export const inboundEmail = onRequest(
+  {
+    region: "us-east1",
+    secrets: [SENDGRID_API_KEY, ADMIN_EMAIL, SENDGRID_FROM],
+  },
+  async (req, res) => {
+    if (req.method !== "POST") {
+      res.status(405).send("Method Not Allowed");
+      return;
+    }
+
+    // Parse multipart/form-data fields from SendGrid Inbound Parse
+    const fields: Record<string, string> = {};
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const busboy = Busboy({ headers: req.headers });
+
+        busboy.on("field", (name: string, val: string) => {
+          fields[name] = val;
+        });
+
+        // Ignore file attachments — we only need the parsed fields
+        busboy.on("file", (_name, file) => {
+          file.resume();
+        });
+
+        busboy.on("finish", resolve);
+        busboy.on("error", reject);
+
+        busboy.end(req.rawBody);
+      });
+    } catch (parseErr) {
+      console.error("Failed to parse inbound email:", parseErr);
+      res.status(400).send("Bad Request");
+      return;
+    }
+
+    const sentTo = fields.to || "Unknown recipient";
+    // In raw MIME mode, content lives in the `email` field.
+    // Fall back to parsed `text`/`html` fields if available.
+    const rawMime = fields.email || "";
+
+    let senderEmail = "";
+    let originalSubject = "";
+    let textContent = "";
+    let htmlContent = "";
+
+    if (rawMime) {
+      const parsed = await simpleParser(rawMime);
+      senderEmail = parsed.from?.value?.[0]?.address || "";
+      originalSubject = parsed.subject || "";
+      textContent = parsed.text || "";
+      htmlContent = typeof parsed.html === "string" ? parsed.html : "";
+    }
+
+    // Fall back to SendGrid's parsed form fields if MIME parsing came up empty
+    if (!senderEmail) {
+      const senderFrom = fields.from || "Unknown sender";
+      const emailMatch = senderFrom.match(/<([^>]+)>/);
+      senderEmail = emailMatch ? emailMatch[1] : senderFrom.trim();
+    }
+    if (!originalSubject) {
+      originalSubject = fields.subject || "(No subject)";
+    }
+    if (!textContent && !htmlContent) {
+      textContent = fields.text || "";
+      htmlContent = fields.html || "";
+    }
+
+    // Build relay email
+    sgMail.setApiKey(SENDGRID_API_KEY.value());
+
+    const adminEmailAddr = ADMIN_EMAIL.value();
+    const from = SENDGRID_FROM.value();
+
+    const relayMsg: sgMail.MailDataRequired = {
+      to: adminEmailAddr,
+      from,
+      subject: `Moboil | ${originalSubject}`,
+      text: `Email to ${sentTo} from ${senderEmail}:\n\n${textContent || htmlContent || "Unknown content"}`,
+      html: `<p><strong>To ${sentTo}:</strong><br /><strong>From ${senderEmail}:</strong></p><hr/>${htmlContent || textContent || "Unknown content"}`,
+    };
+
+    try {
+      await sgMail.send(relayMsg);
+      console.log(`Relayed inbound email to ${sentTo} from ${senderEmail}`);
+      res.status(200).send("OK");
+    } catch (sendErr) {
+      console.error(`Failed to relay inbound email to ${sentTo} from ${senderEmail}:`, sendErr);
+      res.status(500).send("Failed to relay email");
+    }
   }
 );
