@@ -25,6 +25,12 @@ interface BookingData {
   carYear?: string;
   carMake?: string;
   carModel?: string;
+  promoCode?: string | null;
+  promoDiscountValue?: number;
+  promoDiscountUnit?: "dollars" | "percent" | null;
+  promoDiscountAmount?: number;
+  basePrice?: number;
+  finalPrice?: number;
   status?: string;
   emailStatus?: {
     customer?: string;
@@ -42,6 +48,10 @@ const TIME_SLOTS = [
   { hour: 16, minute: 0 },   // 4:00 PM
   { hour: 17, minute: 30 },  // 5:30 PM
 ];
+
+const DOLLAR_PROMO_CODES: Record<string, number> = {
+  GNV20OFF: 20,
+};
 
 /**
  * Returns the UTC offset in hours for America/New_York at a given date.
@@ -90,7 +100,7 @@ export const getAvailableSlots = onCall(
     const nowEastern = new Date(
       new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
     );
-    const launchDate = new Date(2026, 1, 21); // Feb 21, 2026
+    const launchDate = new Date(2026, 2, 1); // Mar 1, 2026
     const startDate = nowEastern > launchDate ? new Date(nowEastern) : new Date(launchDate);
 
     if (nowEastern > launchDate) {
@@ -151,6 +161,32 @@ export const getAvailableSlots = onCall(
     const availableSlots = allSlots.filter((ts) => !takenTimes.has(ts));
 
     return { slots: availableSlots };
+  }
+);
+
+/**
+ * Callable function to validate promo codes.
+ * Returns amountOff and unit for the frontend to calculate totals.
+ */
+export const checkPromoCode = onCall(
+  { region: "us-east1" },
+  async (request) => {
+    const rawCode = request.data?.code;
+    if (typeof rawCode !== "string") {
+      throw new HttpsError("invalid-argument", "Promo code must be a string.");
+    }
+
+    const code = rawCode.trim().toUpperCase();
+    if (!code) {
+      return { amountOff: 0, unit: "dollars" as const };
+    }
+
+    const dollarAmount = DOLLAR_PROMO_CODES[code];
+    if (typeof dollarAmount === "number" && dollarAmount > 0) {
+      return { amountOff: dollarAmount, unit: "dollars" as const };
+    }
+
+    return { amountOff: 0, unit: "dollars" as const };
   }
 );
 
@@ -287,6 +323,25 @@ export const onBookingCreated = onDocumentCreated(
         specialInstructions
     );
 
+    const basePrice = typeof booking.basePrice === "number" ? booking.basePrice : 97;
+    const promoCode = typeof booking.promoCode === "string" ? booking.promoCode.trim().toUpperCase() : "";
+    const promoDiscountValue =
+      typeof booking.promoDiscountValue === "number" ? booking.promoDiscountValue : 0;
+    const promoDiscountUnit =
+      booking.promoDiscountUnit === "percent" || booking.promoDiscountUnit === "dollars"
+        ? booking.promoDiscountUnit
+        : "dollars";
+    const promoDiscountAmount =
+      typeof booking.promoDiscountAmount === "number" ? booking.promoDiscountAmount : 0;
+    const finalPrice =
+      typeof booking.finalPrice === "number" ? booking.finalPrice : Math.max(0, basePrice - promoDiscountAmount);
+    const hasPromo = Boolean(promoCode && promoDiscountAmount > 0);
+    const promoLabel = hasPromo
+      ? promoDiscountUnit === "percent"
+        ? `${promoDiscountValue}% off`
+        : `$${promoDiscountValue} off`
+      : "";
+
     const dynamicTemplateData = {
       brandName: booking.brandName || "Moboil",
       year: booking.dateTime ? new Date(booking.dateTime).getFullYear() : new Date().getFullYear(),
@@ -320,6 +375,12 @@ export const onBookingCreated = onDocumentCreated(
       // notes
       specialInstructions,
       hasCarOrLocationOrInstructions,
+      basePrice,
+      promoCode,
+      promoLabel,
+      promoDiscountAmount,
+      finalPrice,
+      hasPromo,
     };
 
     // --- 5) Customer email (dynamic template) ---
@@ -342,6 +403,9 @@ export const onBookingCreated = onDocumentCreated(
         `Phone: ${booking.phone || "N/A"}\n` +
         `When: ${bookingDate} ${bookingTime}\n` +
         `Service: ${booking.service || "Oil Change"}\n` +
+        `Base price: $${basePrice.toFixed(2)}\n` +
+        `Promo: ${hasPromo ? `${promoCode} (${promoLabel}) -$${promoDiscountAmount.toFixed(2)}` : "None"}\n` +
+        `Final price: $${finalPrice.toFixed(2)}\n` +
         `Car: ${carSummary || [carYear, carMake, carModel].filter(Boolean).join(" ")}\n` +
         `Location: ${locationLine}\n` +
         `Address: ${addressLine1}${addressLine2 ? ", " + addressLine2 : ""}, ${city} ${state} ${zip}\n` +
